@@ -1,0 +1,19 @@
+[library]
+name = "@lam/redis"
+version = "1.0.0"
+description = "Redis client for Lammergeier with strings, JSON, collections, pub/sub, and pipelines"
+license = "Apache-2.0"
+authors = ["Lammergeier contributors"]
+repository = "https://github.com/thallium-solutions/lam-redis"
+homepage = "https://github.com/thallium-solutions/lam-redis"
+
+[compatibility]
+lamc = "^1.16"
+
+[go-deps]
+"github.com/redis/go-redis/v9" = "v9.19.0"
+
+[scripts]
+test = "python3 tests/run_lamredis_tests.py --verbose"
+format = "lamc fmt ."
+service = "sh test-services.sh"

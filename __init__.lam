@@ -1,0 +1,10 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Public @lam/redis package surface.
+
+from .redis import PubSub, Redis
+
+func tag() -> str {
+    return "@lam/redis@1.0.0"
+}
