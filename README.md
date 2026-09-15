@@ -280,6 +280,20 @@ wrappers do not duplicate `context.Background()` or `context.WithTimeout()`
 logic. This keeps the public `Redis`/`PubSub` signatures unchanged while making
 context ownership explicit.
 
+The internal ownership pattern uses the Lam 1.16 names directly:
+
+```lammergeier
+root: Context = Context.simple()
+waitContext: Context = root.expirable(250, "milliseconds")
+remaining: int = waitContext.expiresIn("milliseconds")
+if waitContext.expired() {
+    print(waitContext.reason())
+}
+```
+
+`expirable(value, unit)` is relative. Passing `None` as the unit treats `value`
+as an absolute Unix-millisecond expiry.
+
 ## Service-backed tests
 
 The two migrated stdlib integration tests are compiled as real package
