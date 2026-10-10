@@ -1,14 +1,12 @@
 # Copyright 2026 Thallium Solutions di Busconi Alessandro.
 # SPDX-License-Identifier: Apache-2.0
 #
-# @lam/redis — Redis client for Lammergeier.
-#
-# Migrated from the Lammergeier lamredis stdlib module. The public PubSub and
-# Redis APIs are preserved while command and subscription contexts use the
-# lamcontext standard library instead of a duplicated raw Go context.
+# @lam/redis — Result-first Redis client for Lammergeier.
 
 from lamcontext import Context
+from lamerrors import Error, Result
 
+# Raw Go is intentionally limited to context unwrapping and go-redis calls.
 go! {
     import (
         "context"
@@ -21,978 +19,1169 @@ go! {
         rdb "github.com/redis/go-redis/v9"
     )
 
-    func lamRedisToString(v interface{}) string {
-        switch x := v.(type) {
+    func lamRedisToString(value interface{}) string {
+        switch typed := value.(type) {
         case nil:
             return ""
         case string:
-            return x
+            return typed
         case []byte:
-            return string(x)
+            return string(typed)
         case bool:
-            if x {
+            if typed {
                 return "1"
             }
             return "0"
         case int:
-            return strconv.Itoa(x)
+            return strconv.Itoa(typed)
         case int64:
-            return strconv.FormatInt(x, 10)
+            return strconv.FormatInt(typed, 10)
         case float64:
-            return strconv.FormatFloat(x, 'g', -1, 64)
+            return strconv.FormatFloat(typed, 'g', -1, 64)
         default:
-            return fmt.Sprintf("%v", x)
+            return fmt.Sprintf("%v", typed)
         }
     }
 
     func lamRedisArgs(values []interface{}) []interface{} {
         out := make([]interface{}, 0, len(values))
-        for _, v := range values {
-            out = append(out, lamRedisToString(v))
+        for _, value := range values {
+            out = append(out, lamRedisToString(value))
         }
         return out
     }
 
-    func lamRedisStrings(values []interface{}) []string {
-        out := make([]string, len(values))
-        for i, v := range values {
-            out[i] = lamRedisToString(v)
-        }
-        return out
+    func lamRedisStrings(values []string) []string {
+        return append([]string(nil), values...)
     }
 
     func lamRedisIsNil(err error) bool {
         return errors.Is(err, rdb.Nil)
     }
 
-    func lamRedisContext(value *Context) context.Context {
+    func lamRedisContext(value *Context) (context.Context, error) {
         if value == nil {
-            panic("redis: missing command context")
+            return nil, errors.New("missing command context")
         }
         native, ok := value.Native().(context.Context)
         if !ok || native == nil {
-            panic("redis: invalid command context")
+            return nil, errors.New("invalid command context")
         }
-        return native
+        return native, nil
+    }
+
+    func lamRedisState(raw interface{}, value *Context) (*rdb.Client, context.Context, error) {
+        client, ok := raw.(*rdb.Client)
+        if !ok || client == nil {
+            return nil, nil, errors.New("client is closed")
+        }
+        ctx, err := lamRedisContext(value)
+        if err != nil {
+            return nil, nil, err
+        }
+        return client, ctx, nil
+    }
+
+    func lamRedisFailure(operation string, err error) *LAMMERGEIER.Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+            "RedisError", fmt.Sprintf("redis: %s: %v", operation, err), nil,
+        ))
+    }
+
+    func lamRedisMissing(operation string) *LAMMERGEIER.Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+            "RedisNotFound", fmt.Sprintf("redis: %s: value not found", operation), nil,
+        ))
+    }
+
+    func lamRedisReceiveFailure(operation string, ctx context.Context, err error) *LAMMERGEIER.Result {
+        if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "RedisTimeout", fmt.Sprintf("redis: %s: timed out", operation), nil,
+            ))
+        }
+        if errors.Is(ctx.Err(), context.Canceled) {
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "RedisClosed", fmt.Sprintf("redis: %s: subscription is closed", operation), nil,
+            ))
+        }
+        return lamRedisFailure(operation, err)
+    }
+}
+
+class RedisCommand {
+    #- One arbitrary command in a pipeline. args intentionally uses any because
+       Redis commands accept heterogeneous protocol values. -#
+
+    func init(self, name: str, args: list[any] = []) {
+        self.name: str = name
+        self.args: list[any] = args
+    }
+}
+
+class RedisScanPage {
+    func init(self, cursor: int, keys: list[str]) {
+        self.cursor: int = cursor
+        self.keys: list[str] = keys
+    }
+}
+
+class RedisZMember {
+    func init(self, member: str, score: float) {
+        self.member: str = member
+        self.score: float = score
     }
 }
 
 class PubSub {
-    #- Blocking iterator returned by Redis.subscribe and Redis.psubscribe. -#
+    #- Blocking Result-first iterator returned by subscribe and psubscribe. -#
 
-    func __init__(self) {
+    func init(self) {
         self._ps: any = None
         self._context: Context = Context.simple()
         self._timeoutMs: int = 0
+        self._closed: bool = false
     }
 
-    func setTimeout(self, ms: int) {
-        #- Limit each next/nextWith wait to ms milliseconds; 0 waits forever. -#
+    func setTimeout(self, ms: int) -> Result[bool] {
+        if ms < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: PubSub timeout cannot be negative", None))
+        }
         self._timeoutMs = ms
+        return Result.Ok(true)
     }
 
-    func next(self) -> str {
-        #- Return the next payload, or "" after timeout/close/cancellation. -#
-        out: str = ""
+    func next(self) -> Result[str] {
+        #- Return the next payload. Timeout, closure, cancellation, and receive
+           failures are explicit errors rather than an empty-string sentinel. -#
+        if self._closed {
+            return Result.Err(Error("RedisClosed", "redis: PubSub.next: subscription is closed", None))
+        }
         waitContext: Context = self._context.child()
         if self._timeoutMs > 0 {
-            waitContext = self._context.expirable(self._timeoutMs, "milliseconds")
+            waitContext = self._context.expirable(self._timeoutMs, "milliseconds")?
         }
         go! {
             defer waitContext.Cancel("redis pubsub wait complete")
-            ps, _ := s._ps.(*rdb.PubSub)
-            if ps == nil {
-                return ""
+            subscription, ok := s._ps.(*rdb.PubSub)
+            if !ok || subscription == nil {
+                return lamRedisFailure("PubSub.next", errors.New("subscription is not initialized"))
             }
-            msg, err := ps.ReceiveMessage(lamRedisContext(waitContext))
+            ctx, contextErr := lamRedisContext(waitContext)
+            if contextErr != nil {
+                return lamRedisFailure("PubSub.next", contextErr)
+            }
+            message, err := subscription.ReceiveMessage(ctx)
             if err != nil {
-                return ""
+                return lamRedisReceiveFailure("PubSub.next", ctx, err)
             }
-            out = msg.Payload
+            return LAMMERGEIER.Result.Ok(message.Payload)
         }
-        return out
     }
 
-    func nextWith(self) -> dict[str, str] {
+    func nextWith(self) -> Result[dict[str, str]] {
         #- Return channel, pattern, and payload for the next message. -#
-        out: dict[str, str] = {}
+        if self._closed {
+            return Result.Err(Error("RedisClosed", "redis: PubSub.nextWith: subscription is closed", None))
+        }
         waitContext: Context = self._context.child()
         if self._timeoutMs > 0 {
-            waitContext = self._context.expirable(self._timeoutMs, "milliseconds")
+            waitContext = self._context.expirable(self._timeoutMs, "milliseconds")?
         }
         go! {
             defer waitContext.Cancel("redis pubsub wait complete")
-            ps, _ := s._ps.(*rdb.PubSub)
-            if ps == nil {
-                return nil
+            subscription, ok := s._ps.(*rdb.PubSub)
+            if !ok || subscription == nil {
+                return lamRedisFailure("PubSub.nextWith", errors.New("subscription is not initialized"))
             }
-            msg, err := ps.ReceiveMessage(lamRedisContext(waitContext))
+            ctx, contextErr := lamRedisContext(waitContext)
+            if contextErr != nil {
+                return lamRedisFailure("PubSub.nextWith", contextErr)
+            }
+            message, err := subscription.ReceiveMessage(ctx)
             if err != nil {
-                return nil
+                return lamRedisReceiveFailure("PubSub.nextWith", ctx, err)
             }
-            out["channel"] = msg.Channel
-            out["pattern"] = msg.Pattern
-            out["payload"] = msg.Payload
+            return LAMMERGEIER.Result.Ok(map[string]string{
+                "channel": message.Channel,
+                "pattern": message.Pattern,
+                "payload": message.Payload,
+            })
         }
-        return out
     }
 
-    func close(self) {
-        #- Stop the subscription and release its connection. Idempotent. -#
+    func close(self) -> Result[any] {
+        if self._closed {
+            return Result.Ok(None)
+        }
+        self._closed = true
+        self._context.cancel("redis pubsub closed")
         go! {
-            if ps, ok := s._ps.(*rdb.PubSub); ok && ps != nil {
-                ps.Close()
+            subscription, _ := s._ps.(*rdb.PubSub)
+            if subscription != nil {
+                if err := subscription.Close(); err != nil {
+                    return lamRedisFailure("PubSub.close", err)
+                }
             }
             s._ps = nil
+            return LAMMERGEIER.Result.Ok(nil)
         }
-        self._context.cancel("redis pubsub closed")
     }
 }
 
 class Redis {
-    #- Thread-safe Redis client backed by go-redis's connection pool. -#
+    #- Thread-safe Redis client backed by go-redis's connection pool. All
+       service, transport, parse, and wrong-type failures return Result. -#
 
-    func __init__(self) {
+    func init(self) {
         self._client: any = None
         self._context: Context = Context.simple()
+        self._closed: bool = false
     }
 
-    static func connect(addr: str, password: str = "", db: int = 0, username: str = "") -> Redis {
-        #- Connect to host:port, optionally using password, ACL username, and DB. -#
+    static func connect(addr: str, password: str = "", db: int = 0, username: str = "") -> Result[Redis] {
+        #- Create a client and eagerly PING it. -#
+        if addr.trim() == "" {
+            return Result.Err(Error("RedisArgumentError", "redis: address must not be empty", None))
+        }
+        if db < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: database number cannot be negative", None))
+        }
         redis: Redis = Redis()
         go! {
-            redis._client = rdb.NewClient(&rdb.Options{
-                Addr:     addr,
-                Username: username,
-                Password: password,
-                DB:       db,
+            client := rdb.NewClient(&rdb.Options{
+                Addr: addr, Username: username, Password: password, DB: db,
             })
+            ctx, contextErr := lamRedisContext(redis._context)
+            if contextErr != nil {
+                _ = client.Close()
+                return lamRedisFailure("connect", contextErr)
+            }
+            if err := client.Ping(ctx).Err(); err != nil {
+                _ = client.Close()
+                return lamRedisFailure("connect", err)
+            }
+            redis._client = client
+            return LAMMERGEIER.Result.Ok(redis)
         }
-        _ = redis.ping()
-        return redis
     }
 
-    static func fromUrl(url_: str) -> Redis {
-        #- Parse redis:// or rediss:// connection configuration. -#
+    static func fromUrl(url_: str) -> Result[Redis] {
+        #- Parse redis:// or rediss:// configuration and eagerly PING it. -#
         redis: Redis = Redis()
         go! {
-            opts, err := rdb.ParseURL(url_)
+            options, err := rdb.ParseURL(url_)
             if err != nil {
-                panic(fmt.Sprintf("redis: invalid URL %q: %v", url_, err))
+                return lamRedisFailure("parse URL", err)
             }
-            redis._client = rdb.NewClient(opts)
+            client := rdb.NewClient(options)
+            ctx, contextErr := lamRedisContext(redis._context)
+            if contextErr != nil {
+                _ = client.Close()
+                return lamRedisFailure("connect URL", contextErr)
+            }
+            if err = client.Ping(ctx).Err(); err != nil {
+                _ = client.Close()
+                return lamRedisFailure("connect URL", err)
+            }
+            redis._client = client
+            return LAMMERGEIER.Result.Ok(redis)
         }
-        _ = redis.ping()
-        return redis
     }
 
-    func close(self) {
-        #- Close the connection pool. Idempotent. -#
+    func close(self) -> Result[any] {
+        if self._closed {
+            return Result.Ok(None)
+        }
+        self._closed = true
+        self._context.cancel("redis client closed")
         go! {
-            if c, ok := s._client.(*rdb.Client); ok && c != nil {
-                c.Close()
+            client, _ := s._client.(*rdb.Client)
+            if client != nil {
+                if err := client.Close(); err != nil {
+                    return lamRedisFailure("close", err)
+                }
             }
             s._client = nil
+            return LAMMERGEIER.Result.Ok(nil)
         }
-        self._context.cancel("redis client closed")
     }
 
     # Generic commands and health.
-    func ping(self) -> str {
-        out: str = ""
+    func ping(self) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.Ping(lamRedisContext(s._context)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ping: %v", err))
+                return lamRedisFailure("PING", err)
             }
-            out = value
+            value, err := client.Ping(ctx).Result()
+            if err != nil {
+                return lamRedisFailure("PING", err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func exec(self, cmd: str, args: list[any]) -> any {
-        #- Execute an arbitrary Redis command. -#
-        out: any = None
-        go! {
-            c := s._client.(*rdb.Client)
-            full := append([]interface{}{cmd}, lamRedisArgs(args)...)
-            result, err := c.Do(lamRedisContext(s._context), full...).Result()
-            if err != nil && !lamRedisIsNil(err) {
-                panic(fmt.Sprintf("redis: %s: %v", cmd, err))
-            }
-            out = result
+    func exec(self, command: str, args: list[any] = []) -> Result[any] {
+        #- Execute an arbitrary command. any is required for heterogeneous
+           command arguments and protocol-dependent response values. -#
+        if command.trim() == "" {
+            return Result.Err(Error("RedisArgumentError", "redis: command must not be empty", None))
         }
-        return out
+        go! {
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure(command, err)
+            }
+            full := append([]interface{}{command}, lamRedisArgs(args)...)
+            value, err := client.Do(ctx, full...).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing(command)
+            }
+            if err != nil {
+                return lamRedisFailure(command, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
+        }
     }
 
     # Strings and key lifecycle.
-    func set(self, key: str, value: any, ttlSec: int = 0) {
-        go! {
-            c := s._client.(*rdb.Client)
-            duration := time.Duration(0)
-            if ttlSec > 0 {
-                duration = time.Duration(ttlSec) * time.Second
-            }
-            if err := c.Set(lamRedisContext(s._context), key, lamRedisToString(value), duration).Err(); err != nil {
-                panic(fmt.Sprintf("redis: SET %s: %v", key, err))
-            }
+    func set(self, key: str, value: any, ttlSec: int = 0) -> Result[bool] {
+        if ttlSec < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: ttlSec cannot be negative", None))
         }
-    }
-
-    func setNx(self, key: str, value: any, ttlSec: int = 0) -> bool {
-        ok: bool = false
         go! {
-            c := s._client.(*rdb.Client)
-            duration := time.Duration(0)
-            if ttlSec > 0 {
-                duration = time.Duration(ttlSec) * time.Second
-            }
-            result, err := c.SetNX(lamRedisContext(s._context), key, lamRedisToString(value), duration).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SETNX %s: %v", key, err))
+                return lamRedisFailure("SET "+key, err)
             }
-            ok = result
+            duration := time.Duration(ttlSec) * time.Second
+            if err = client.Set(ctx, key, lamRedisToString(value), duration).Err(); err != nil {
+                return lamRedisFailure("SET "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
         }
-        return ok
     }
 
-    func get(self, key: str) -> str {
-        out: str = ""
+    func setNx(self, key: str, value: any, ttlSec: int = 0) -> Result[bool] {
+        if ttlSec < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: ttlSec cannot be negative", None))
+        }
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.Get(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: GET %s: %v", key, err))
-                }
-                return ""
+                return lamRedisFailure("SETNX "+key, err)
             }
-            out = value
+            result, err := client.SetNX(ctx, key, lamRedisToString(value), time.Duration(ttlSec)*time.Second).Result()
+            if err != nil {
+                return lamRedisFailure("SETNX "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(result)
         }
-        return out
     }
 
-    func setJson(self, key: str, value: json, ttlSec: int = 0) {
+    func get(self, key: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("GET "+key, err)
+            }
+            value, err := client.Get(ctx, key).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("GET " + key)
+            }
+            if err != nil {
+                return lamRedisFailure("GET "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
+        }
+    }
+
+    func setJson(self, key: str, value: json, ttlSec: int = 0) -> Result[bool] {
+        if ttlSec < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: ttlSec cannot be negative", None))
+        }
+        go! {
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("SET JSON "+key, err)
+            }
             encoded, err := json.Marshal(value)
             if err != nil {
-                panic(fmt.Sprintf("redis: JSON encode %s: %v", key, err))
+                return lamRedisFailure("encode JSON "+key, err)
             }
-            duration := time.Duration(0)
-            if ttlSec > 0 {
-                duration = time.Duration(ttlSec) * time.Second
+            if err = client.Set(ctx, key, string(encoded), time.Duration(ttlSec)*time.Second).Err(); err != nil {
+                return lamRedisFailure("SET JSON "+key, err)
             }
-            if err := c.Set(lamRedisContext(s._context), key, string(encoded), duration).Err(); err != nil {
-                panic(fmt.Sprintf("redis: SET JSON %s: %v", key, err))
-            }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func getJson(self, key: str) -> json {
+    func getJson(self, key: str) -> Result[json] {
         go! {
-            c := s._client.(*rdb.Client)
-            encoded, err := c.Get(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if lamRedisIsNil(err) {
-                    return lamJSONMust(nil)
-                }
-                panic(fmt.Sprintf("redis: GET JSON %s: %v", key, err))
+                return lamRedisFailure("GET JSON "+key, err)
             }
-            parsed, parseErr := lamJSONParse(encoded)
-            if parseErr != nil {
-                panic(fmt.Sprintf("redis: invalid JSON at %s: %v", key, parseErr))
+            encoded, err := client.Get(ctx, key).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("GET JSON " + key)
             }
-            return parsed
-        }
-    }
-
-    func getDel(self, key: str) -> str {
-        out: str = ""
-        go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.GetDel(lamRedisContext(s._context), key).Result()
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: GETDEL %s: %v", key, err))
-                }
-                return ""
+                return lamRedisFailure("GET JSON "+key, err)
             }
-            out = value
+            parsed, err := lamJSONParse(encoded)
+            if err != nil {
+                return lamRedisFailure("decode JSON "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(parsed)
         }
-        return out
     }
 
-    func mset(self, pairs: dict[str, any]) {
+    func getDel(self, key: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("GETDEL "+key, err)
+            }
+            value, err := client.GetDel(ctx, key).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("GETDEL " + key)
+            }
+            if err != nil {
+                return lamRedisFailure("GETDEL "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
+        }
+    }
+
+    func mset(self, pairs: dict[str, any]) -> Result[bool] {
+        go! {
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("MSET", err)
+            }
             args := make([]interface{}, 0, len(pairs)*2)
             for key, value := range pairs {
                 args = append(args, key, lamRedisToString(value))
             }
-            if err := c.MSet(lamRedisContext(s._context), args...).Err(); err != nil {
-                panic(fmt.Sprintf("redis: MSET: %v", err))
+            if err = client.MSet(ctx, args...).Err(); err != nil {
+                return lamRedisFailure("MSET", err)
             }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func mget(self, keys: list[any]) -> list[str] {
-        out: list[str] = []
+    func mget(self, keys: list[str]) -> Result[list[Result[str]]] {
+        #- The outer Result covers the command; each item Result preserves
+           missing-value information without conflating it with an empty string. -#
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.MGet(lamRedisContext(s._context), lamRedisStrings(keys)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: MGET: %v", err))
+                return lamRedisFailure("MGET", err)
             }
-            for _, value := range values {
+            values, err := client.MGet(ctx, lamRedisStrings(keys)...).Result()
+            if err != nil {
+                return lamRedisFailure("MGET", err)
+            }
+            out := make([]*LAMMERGEIER.Result, 0, len(values))
+            for index, value := range values {
                 if value == nil {
-                    out = append(out, "")
+                    out = append(out, lamRedisMissing(fmt.Sprintf("MGET %s", keys[index])))
                 } else {
-                    out = append(out, lamRedisToString(value))
+                    out = append(out, LAMMERGEIER.Result.Ok(lamRedisToString(value)))
                 }
             }
+            return LAMMERGEIER.Result.Ok(out)
         }
-        return out
     }
 
-    func exists(self, keys: list[any]) -> int {
-        out: int = 0
+    func exists(self, keys: list[str]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.Exists(lamRedisContext(s._context), lamRedisStrings(keys)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: EXISTS: %v", err))
+                return lamRedisFailure("EXISTS", err)
             }
-            out = int(count)
+            count, err := client.Exists(ctx, lamRedisStrings(keys)...).Result()
+            if err != nil {
+                return lamRedisFailure("EXISTS", err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func delete(self, keys: list[any]) -> int {
-        out: int = 0
+    func delete(self, keys: list[str]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.Del(lamRedisContext(s._context), lamRedisStrings(keys)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: DEL: %v", err))
+                return lamRedisFailure("DEL", err)
             }
-            out = int(count)
+            count, err := client.Del(ctx, lamRedisStrings(keys)...).Result()
+            if err != nil {
+                return lamRedisFailure("DEL", err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func expire(self, key: str, ttlSec: int) -> bool {
-        ok: bool = false
+    func expire(self, key: str, ttlSec: int) -> Result[bool] {
         go! {
-            c := s._client.(*rdb.Client)
-            result, err := c.Expire(lamRedisContext(s._context), key, time.Duration(ttlSec)*time.Second).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: EXPIRE %s: %v", key, err))
+                return lamRedisFailure("EXPIRE "+key, err)
             }
-            ok = result
+            value, err := client.Expire(ctx, key, time.Duration(ttlSec)*time.Second).Result()
+            if err != nil {
+                return lamRedisFailure("EXPIRE "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return ok
     }
 
-    func persist(self, key: str) -> bool {
-        ok: bool = false
+    func persist(self, key: str) -> Result[bool] {
         go! {
-            c := s._client.(*rdb.Client)
-            result, err := c.Persist(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: PERSIST %s: %v", key, err))
+                return lamRedisFailure("PERSIST "+key, err)
             }
-            ok = result
+            value, err := client.Persist(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("PERSIST "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return ok
     }
 
-    func ttl(self, key: str) -> int {
-        out: int = - 2
+    func ttl(self, key: str) -> Result[int] {
+        #- Ok(-1) means persistent; a missing key is RedisNotFound. -#
         go! {
-            c := s._client.(*rdb.Client)
-            duration, err := c.TTL(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: TTL %s: %v", key, err))
+                return lamRedisFailure("TTL "+key, err)
             }
-            switch duration {
-            case time.Duration(-1):
-                out = -1
-            case time.Duration(-2):
-                out = -2
-            default:
-                out = int(duration / time.Second)
+            duration, err := client.TTL(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("TTL "+key, err)
             }
+            if duration == time.Duration(-2) {
+                return lamRedisMissing("TTL " + key)
+            }
+            if duration == time.Duration(-1) {
+                return LAMMERGEIER.Result.Ok(-1)
+            }
+            return LAMMERGEIER.Result.Ok(int(duration / time.Second))
         }
-        return out
     }
 
-    func type_(self, key: str) -> str {
-        out: str = ""
+    func type_(self, key: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.Type(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: TYPE %s: %v", key, err))
+                return lamRedisFailure("TYPE "+key, err)
             }
-            out = value
+            value, err := client.Type(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("TYPE "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func keys(self, pattern: str) -> list[str] {
-        out: list[str] = []
+    func keys(self, pattern: str) -> Result[list[str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.Keys(lamRedisContext(s._context), pattern).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: KEYS %s: %v", pattern, err))
+                return lamRedisFailure("KEYS "+pattern, err)
             }
-            out = values
+            values, err := client.Keys(ctx, pattern).Result()
+            if err != nil {
+                return lamRedisFailure("KEYS "+pattern, err)
+            }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    func scan(self, cursor: int, match: str = "", count: int = 0) -> dict[str, any] {
-        next: int = 0
-        keys: list[str] = []
-        go! {
-            c := s._client.(*rdb.Client)
-            values, nextCursor, err := c.Scan(lamRedisContext(s._context), uint64(cursor), match, int64(count)).Result()
-            if err != nil {
-                panic(fmt.Sprintf("redis: SCAN: %v", err))
-            }
-            keys = values
-            next = int(nextCursor)
+    func scan(self, cursor: int, match: str = "", count: int = 0) -> Result[RedisScanPage] {
+        if cursor < 0 or count < 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: scan cursor and count cannot be negative", None))
         }
-        out: dict[str, any] = {}
-        out["cursor"] = next
-        out["keys"] = keys
-        return out
+        go! {
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("SCAN", err)
+            }
+            values, next, err := client.Scan(ctx, uint64(cursor), match, int64(count)).Result()
+            if err != nil {
+                return lamRedisFailure("SCAN", err)
+            }
+            return LAMMERGEIER.Result.Ok(NewRedisScanPage(int(next), values))
+        }
     }
 
     # Counters.
-    func incr(self, key: str) -> int {
-        out: int = 0
+    func incr(self, key: str) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.Incr(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: INCR %s: %v", key, err))
+                return lamRedisFailure("INCR "+key, err)
             }
-            out = int(value)
+            value, err := client.Incr(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("INCR "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
-    func incrBy(self, key: str, by: int) -> int {
-        out: int = 0
+    func incrBy(self, key: str, by: int) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.IncrBy(lamRedisContext(s._context), key, int64(by)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: INCRBY %s: %v", key, err))
+                return lamRedisFailure("INCRBY "+key, err)
             }
-            out = int(value)
+            value, err := client.IncrBy(ctx, key, int64(by)).Result()
+            if err != nil {
+                return lamRedisFailure("INCRBY "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
-    func decr(self, key: str) -> int {
-        out: int = 0
+    func decr(self, key: str) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.Decr(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: DECR %s: %v", key, err))
+                return lamRedisFailure("DECR "+key, err)
             }
-            out = int(value)
+            value, err := client.Decr(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("DECR "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
-    func decrBy(self, key: str, by: int) -> int {
-        out: int = 0
+    func decrBy(self, key: str, by: int) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.DecrBy(lamRedisContext(s._context), key, int64(by)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: DECRBY %s: %v", key, err))
+                return lamRedisFailure("DECRBY "+key, err)
             }
-            out = int(value)
+            value, err := client.DecrBy(ctx, key, int64(by)).Result()
+            if err != nil {
+                return lamRedisFailure("DECRBY "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
     # Lists.
-    func lpush(self, key: str, values: list[any]) -> int {
-        out: int = 0
+    func lpush(self, key: str, values: list[any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.LPush(lamRedisContext(s._context), key, lamRedisArgs(values)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: LPUSH %s: %v", key, err))
+                return lamRedisFailure("LPUSH "+key, err)
             }
-            out = int(count)
+            count, err := client.LPush(ctx, key, lamRedisArgs(values)...).Result()
+            if err != nil {
+                return lamRedisFailure("LPUSH "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func rpush(self, key: str, values: list[any]) -> int {
-        out: int = 0
+    func rpush(self, key: str, values: list[any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.RPush(lamRedisContext(s._context), key, lamRedisArgs(values)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: RPUSH %s: %v", key, err))
+                return lamRedisFailure("RPUSH "+key, err)
             }
-            out = int(count)
+            count, err := client.RPush(ctx, key, lamRedisArgs(values)...).Result()
+            if err != nil {
+                return lamRedisFailure("RPUSH "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func lpop(self, key: str) -> str {
-        out: str = ""
+    func lpop(self, key: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.LPop(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: LPOP %s: %v", key, err))
-                }
-                return ""
+                return lamRedisFailure("LPOP "+key, err)
             }
-            out = value
+            value, err := client.LPop(ctx, key).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("LPOP " + key)
+            }
+            if err != nil {
+                return lamRedisFailure("LPOP "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func rpop(self, key: str) -> str {
-        out: str = ""
+    func rpop(self, key: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.RPop(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: RPOP %s: %v", key, err))
-                }
-                return ""
+                return lamRedisFailure("RPOP "+key, err)
             }
-            out = value
+            value, err := client.RPop(ctx, key).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("RPOP " + key)
+            }
+            if err != nil {
+                return lamRedisFailure("RPOP "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func llen(self, key: str) -> int {
-        out: int = 0
+    func llen(self, key: str) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.LLen(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: LLEN %s: %v", key, err))
+                return lamRedisFailure("LLEN "+key, err)
             }
-            out = int(count)
+            value, err := client.LLen(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("LLEN "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
-    func lrange(self, key: str, start: int, stop: int) -> list[str] {
-        out: list[str] = []
+    func lrange(self, key: str, start: int, stop: int) -> Result[list[str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.LRange(lamRedisContext(s._context), key, int64(start), int64(stop)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: LRANGE %s: %v", key, err))
+                return lamRedisFailure("LRANGE "+key, err)
             }
-            out = values
+            values, err := client.LRange(ctx, key, int64(start), int64(stop)).Result()
+            if err != nil {
+                return lamRedisFailure("LRANGE "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    # Hashes.
-    func hset(self, key: str, field: str, value: any) -> int {
-        out: int = 0
+    # Hashes. hset is overloaded for one field or a map of fields.
+    func hset(self, key: str, field: str, value: any) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.HSet(lamRedisContext(s._context), key, field, lamRedisToString(value)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HSET %s: %v", key, err))
+                return lamRedisFailure("HSET "+key, err)
             }
-            out = int(count)
+            count, err := client.HSet(ctx, key, field, lamRedisToString(value)).Result()
+            if err != nil {
+                return lamRedisFailure("HSET "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func hsetMap(self, key: str, fields: dict[str, any]) -> int {
-        out: int = 0
+    func hset(self, key: str, fields: dict[str, any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("HSET "+key, err)
+            }
             args := make([]interface{}, 0, len(fields)*2)
             for field, value := range fields {
                 args = append(args, field, lamRedisToString(value))
             }
-            count, err := c.HSet(lamRedisContext(s._context), key, args...).Result()
+            count, err := client.HSet(ctx, key, args...).Result()
             if err != nil {
-                panic(fmt.Sprintf("redis: HSET %s: %v", key, err))
+                return lamRedisFailure("HSET "+key, err)
             }
-            out = int(count)
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func hget(self, key: str, field: str) -> str {
-        out: str = ""
+    func hget(self, key: str, field: str) -> Result[str] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.HGet(lamRedisContext(s._context), key, field).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: HGET %s.%s: %v", key, field, err))
-                }
-                return ""
+                return lamRedisFailure("HGET "+key+"."+field, err)
             }
-            out = value
+            value, err := client.HGet(ctx, key, field).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("HGET " + key + "." + field)
+            }
+            if err != nil {
+                return lamRedisFailure("HGET "+key+"."+field, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func hgetAll(self, key: str) -> dict[str, str] {
-        out: dict[str, str] = {}
+    func hgetAll(self, key: str) -> Result[dict[str, str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.HGetAll(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HGETALL %s: %v", key, err))
+                return lamRedisFailure("HGETALL "+key, err)
             }
-            for field, value := range values {
-                out[field] = value
+            values, err := client.HGetAll(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("HGETALL "+key, err)
             }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    func hdel(self, key: str, fields: list[any]) -> int {
-        out: int = 0
+    func hdel(self, key: str, fields: list[str]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.HDel(lamRedisContext(s._context), key, lamRedisStrings(fields)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HDEL %s: %v", key, err))
+                return lamRedisFailure("HDEL "+key, err)
             }
-            out = int(count)
+            count, err := client.HDel(ctx, key, lamRedisStrings(fields)...).Result()
+            if err != nil {
+                return lamRedisFailure("HDEL "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func hexists(self, key: str, field: str) -> bool {
-        out: bool = false
+    func hexists(self, key: str, field: str) -> Result[bool] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.HExists(lamRedisContext(s._context), key, field).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HEXISTS %s.%s: %v", key, field, err))
+                return lamRedisFailure("HEXISTS "+key+"."+field, err)
             }
-            out = value
+            value, err := client.HExists(ctx, key, field).Result()
+            if err != nil {
+                return lamRedisFailure("HEXISTS "+key+"."+field, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func hkeys(self, key: str) -> list[str] {
-        out: list[str] = []
+    func hkeys(self, key: str) -> Result[list[str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.HKeys(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HKEYS %s: %v", key, err))
+                return lamRedisFailure("HKEYS "+key, err)
             }
-            out = values
+            values, err := client.HKeys(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("HKEYS "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    func hincrBy(self, key: str, field: str, by: int) -> int {
-        out: int = 0
+    func hincrBy(self, key: str, field: str, by: int) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.HIncrBy(lamRedisContext(s._context), key, field, int64(by)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: HINCRBY %s.%s: %v", key, field, err))
+                return lamRedisFailure("HINCRBY "+key+"."+field, err)
             }
-            out = int(value)
+            value, err := client.HIncrBy(ctx, key, field, int64(by)).Result()
+            if err != nil {
+                return lamRedisFailure("HINCRBY "+key+"."+field, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
     # Sets.
-    func sadd(self, key: str, members: list[any]) -> int {
-        out: int = 0
+    func sadd(self, key: str, members: list[any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.SAdd(lamRedisContext(s._context), key, lamRedisArgs(members)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SADD %s: %v", key, err))
+                return lamRedisFailure("SADD "+key, err)
             }
-            out = int(count)
+            count, err := client.SAdd(ctx, key, lamRedisArgs(members)...).Result()
+            if err != nil {
+                return lamRedisFailure("SADD "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func srem(self, key: str, members: list[any]) -> int {
-        out: int = 0
+    func srem(self, key: str, members: list[any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.SRem(lamRedisContext(s._context), key, lamRedisArgs(members)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SREM %s: %v", key, err))
+                return lamRedisFailure("SREM "+key, err)
             }
-            out = int(count)
+            count, err := client.SRem(ctx, key, lamRedisArgs(members)...).Result()
+            if err != nil {
+                return lamRedisFailure("SREM "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func smembers(self, key: str) -> list[str] {
-        out: list[str] = []
+    func smembers(self, key: str) -> Result[list[str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.SMembers(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SMEMBERS %s: %v", key, err))
+                return lamRedisFailure("SMEMBERS "+key, err)
             }
-            out = values
+            values, err := client.SMembers(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("SMEMBERS "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    func sismember(self, key: str, member: any) -> bool {
-        out: bool = false
+    func sismember(self, key: str, member: any) -> Result[bool] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.SIsMember(lamRedisContext(s._context), key, lamRedisToString(member)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SISMEMBER %s: %v", key, err))
+                return lamRedisFailure("SISMEMBER "+key, err)
             }
-            out = value
+            value, err := client.SIsMember(ctx, key, lamRedisToString(member)).Result()
+            if err != nil {
+                return lamRedisFailure("SISMEMBER "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func scard(self, key: str) -> int {
-        out: int = 0
+    func scard(self, key: str) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.SCard(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: SCARD %s: %v", key, err))
+                return lamRedisFailure("SCARD "+key, err)
             }
-            out = int(count)
+            value, err := client.SCard(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("SCARD "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
     # Sorted sets.
-    func zadd(self, key: str, score: float, member: any) -> int {
-        out: int = 0
+    func zadd(self, key: str, score: float, member: any) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            item := rdb.Z{Score: score, Member: lamRedisToString(member)}
-            count, err := c.ZAdd(lamRedisContext(s._context), key, item).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZADD %s: %v", key, err))
+                return lamRedisFailure("ZADD "+key, err)
             }
-            out = int(count)
+            count, err := client.ZAdd(ctx, key, rdb.Z{Score: score, Member: lamRedisToString(member)}).Result()
+            if err != nil {
+                return lamRedisFailure("ZADD "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func zincrBy(self, key: str, by: float, member: any) -> float {
-        out: float = 0.0
+    func zincrBy(self, key: str, by: float, member: any) -> Result[float] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.ZIncrBy(lamRedisContext(s._context), key, by, lamRedisToString(member)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZINCRBY %s: %v", key, err))
+                return lamRedisFailure("ZINCRBY "+key, err)
             }
-            out = value
+            value, err := client.ZIncrBy(ctx, key, by, lamRedisToString(member)).Result()
+            if err != nil {
+                return lamRedisFailure("ZINCRBY "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func zscore(self, key: str, member: any) -> float {
-        out: float = 0.0
+    func zscore(self, key: str, member: any) -> Result[float] {
         go! {
-            c := s._client.(*rdb.Client)
-            value, err := c.ZScore(lamRedisContext(s._context), key, lamRedisToString(member)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                if !lamRedisIsNil(err) {
-                    panic(fmt.Sprintf("redis: ZSCORE %s: %v", key, err))
-                }
-                return 0.0
+                return lamRedisFailure("ZSCORE "+key, err)
             }
-            out = value
+            value, err := client.ZScore(ctx, key, lamRedisToString(member)).Result()
+            if lamRedisIsNil(err) {
+                return lamRedisMissing("ZSCORE " + key)
+            }
+            if err != nil {
+                return lamRedisFailure("ZSCORE "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func zrange(self, key: str, start: int, stop: int) -> list[str] {
-        out: list[str] = []
+    func zrange(self, key: str, start: int, stop: int) -> Result[list[str]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.ZRange(lamRedisContext(s._context), key, int64(start), int64(stop)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZRANGE %s: %v", key, err))
+                return lamRedisFailure("ZRANGE "+key, err)
             }
-            out = values
+            values, err := client.ZRange(ctx, key, int64(start), int64(stop)).Result()
+            if err != nil {
+                return lamRedisFailure("ZRANGE "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(values)
         }
-        return out
     }
 
-    func zrangeWithScores(self, key: str, start: int, stop: int) -> list[dict[str, any]] {
-        out: list[dict[str, any]] = []
+    func zrangeWithScores(self, key: str, start: int, stop: int) -> Result[list[RedisZMember]] {
         go! {
-            c := s._client.(*rdb.Client)
-            values, err := c.ZRangeWithScores(lamRedisContext(s._context), key, int64(start), int64(stop)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZRANGE %s: %v", key, err))
+                return lamRedisFailure("ZRANGE "+key, err)
             }
-            for _, item := range values {
-                row := map[string]interface{}{
-                    "member": lamRedisToString(item.Member),
-                    "score":  item.Score,
-                }
-                out = append(out, row)
+            values, err := client.ZRangeWithScores(ctx, key, int64(start), int64(stop)).Result()
+            if err != nil {
+                return lamRedisFailure("ZRANGE "+key, err)
             }
+            out := make([]*RedisZMember, 0, len(values))
+            for _, value := range values {
+                out = append(out, NewRedisZMember(lamRedisToString(value.Member), value.Score))
+            }
+            return LAMMERGEIER.Result.Ok(out)
         }
-        return out
     }
 
-    func zrem(self, key: str, members: list[any]) -> int {
-        out: int = 0
+    func zrem(self, key: str, members: list[any]) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.ZRem(lamRedisContext(s._context), key, lamRedisArgs(members)...).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZREM %s: %v", key, err))
+                return lamRedisFailure("ZREM "+key, err)
             }
-            out = int(count)
+            count, err := client.ZRem(ctx, key, lamRedisArgs(members)...).Result()
+            if err != nil {
+                return lamRedisFailure("ZREM "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func zcard(self, key: str) -> int {
-        out: int = 0
+    func zcard(self, key: str) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.ZCard(lamRedisContext(s._context), key).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: ZCARD %s: %v", key, err))
+                return lamRedisFailure("ZCARD "+key, err)
             }
-            out = int(count)
+            value, err := client.ZCard(ctx, key).Result()
+            if err != nil {
+                return lamRedisFailure("ZCARD "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
         }
-        return out
     }
 
     # Pub/Sub.
-    func publish(self, channel: str, message: any) -> int {
-        out: int = 0
+    func publish(self, channel: str, message: any) -> Result[int] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.Publish(lamRedisContext(s._context), channel, lamRedisToString(message)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: PUBLISH %s: %v", channel, err))
+                return lamRedisFailure("PUBLISH "+channel, err)
             }
-            out = int(count)
+            count, err := client.Publish(ctx, channel, lamRedisToString(message)).Result()
+            if err != nil {
+                return lamRedisFailure("PUBLISH "+channel, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(count))
         }
-        return out
     }
 
-    func subscribe(self, channels: list[any]) -> PubSub {
+    func subscribe(self, channels: list[str]) -> Result[PubSub] {
+        if len(channels) == 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: subscribe requires at least one channel", None))
+        }
         subscription: PubSub = PubSub()
         subscription._context = self._context.child()
         go! {
-            c := s._client.(*rdb.Client)
-            ctx := lamRedisContext(s._context)
-            sub := c.Subscribe(ctx, lamRedisStrings(channels)...)
-            if _, err := sub.Receive(ctx); err != nil {
-                sub.Close()
-                panic(fmt.Sprintf("redis: SUBSCRIBE: %v", err))
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("SUBSCRIBE", err)
             }
-            subscription._ps = sub
+            raw := client.Subscribe(ctx, lamRedisStrings(channels)...)
+            if _, err = raw.Receive(ctx); err != nil {
+                _ = raw.Close()
+                return lamRedisFailure("SUBSCRIBE", err)
+            }
+            subscription._ps = raw
+            return LAMMERGEIER.Result.Ok(subscription)
         }
-        return subscription
     }
 
-    func psubscribe(self, patterns: list[any]) -> PubSub {
+    func psubscribe(self, patterns: list[str]) -> Result[PubSub] {
+        if len(patterns) == 0 {
+            return Result.Err(Error("RedisArgumentError", "redis: psubscribe requires at least one pattern", None))
+        }
         subscription: PubSub = PubSub()
         subscription._context = self._context.child()
         go! {
-            c := s._client.(*rdb.Client)
-            ctx := lamRedisContext(s._context)
-            sub := c.PSubscribe(ctx, lamRedisStrings(patterns)...)
-            if _, err := sub.Receive(ctx); err != nil {
-                sub.Close()
-                panic(fmt.Sprintf("redis: PSUBSCRIBE: %v", err))
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("PSUBSCRIBE", err)
             }
-            subscription._ps = sub
+            raw := client.PSubscribe(ctx, lamRedisStrings(patterns)...)
+            if _, err = raw.Receive(ctx); err != nil {
+                _ = raw.Close()
+                return lamRedisFailure("PSUBSCRIBE", err)
+            }
+            subscription._ps = raw
+            return LAMMERGEIER.Result.Ok(subscription)
         }
-        return subscription
     }
 
     # Pipelines and utilities.
-    func pipeline(self, commands: list[dict[str, any]]) -> list[any] {
-        out: list[any] = []
+    func pipeline(self, commands: list[RedisCommand]) -> Result[list[Result[any]]] {
+        #- The outer Result reports pipeline setup/state failure. Each ordered
+           inner Result reports that command's value, Redis error, transport
+           failure, or RedisNotFound without stringifying errors. -#
+        for command in commands {
+            if command.name.trim() == "" {
+                return Result.Err(Error("RedisArgumentError", "redis: pipeline command must not be empty", None))
+            }
+        }
         go! {
-            c := s._client.(*rdb.Client)
-            ctx := lamRedisContext(s._context)
-            pipe := c.Pipeline()
-            commanders := make([]rdb.Cmder, 0, len(commands))
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("PIPELINE", err)
+            }
+            pipe := client.Pipeline()
+            queued := make([]*rdb.Cmd, 0, len(commands))
             for _, command := range commands {
-                name, _ := command["cmd"].(string)
-                var args []interface{}
-                if rawArgs, ok := command["args"].([]interface{}); ok {
-                    args = lamRedisArgs(rawArgs)
-                } else if stringArgs, ok := command["args"].([]string); ok {
-                    args = make([]interface{}, len(stringArgs))
-                    for index, value := range stringArgs {
-                        args[index] = value
-                    }
-                }
-                full := append([]interface{}{name}, args...)
-                commanders = append(commanders, pipe.Do(ctx, full...))
+                full := append([]interface{}{command.Name}, lamRedisArgs(command.Args)...)
+                queued = append(queued, pipe.Do(ctx, full...))
             }
             _, _ = pipe.Exec(ctx)
-            for _, commander := range commanders {
-                if command, ok := commander.(*rdb.Cmd); ok {
-                    if value, err := command.Result(); err == nil || lamRedisIsNil(err) {
-                        out = append(out, value)
-                    } else {
-                        out = append(out, fmt.Sprintf("error: %v", err))
-                    }
+            out := make([]*LAMMERGEIER.Result, 0, len(queued))
+            for index, command := range queued {
+                value, commandErr := command.Result()
+                operation := fmt.Sprintf("PIPELINE[%d] %s", index, commands[index].Name)
+                if lamRedisIsNil(commandErr) {
+                    out = append(out, lamRedisMissing(operation))
+                } else if commandErr != nil {
+                    out = append(out, lamRedisFailure(operation, commandErr))
+                } else {
+                    out = append(out, LAMMERGEIER.Result.Ok(value))
                 }
             }
-        }
-        return out
-    }
-
-    func flushDb(self) {
-        go! {
-            c := s._client.(*rdb.Client)
-            if err := c.FlushDB(lamRedisContext(s._context)).Err(); err != nil {
-                panic(fmt.Sprintf("redis: FLUSHDB: %v", err))
-            }
+            return LAMMERGEIER.Result.Ok(out)
         }
     }
 
-    func dbSize(self) -> int {
-        out: int = 0
+    func flushDb(self) -> Result[bool] {
         go! {
-            c := s._client.(*rdb.Client)
-            count, err := c.DBSize(lamRedisContext(s._context)).Result()
+            client, ctx, err := lamRedisState(s._client, s._context)
             if err != nil {
-                panic(fmt.Sprintf("redis: DBSIZE: %v", err))
+                return lamRedisFailure("FLUSHDB", err)
             }
-            out = int(count)
+            if err = client.FlushDB(ctx).Err(); err != nil {
+                return lamRedisFailure("FLUSHDB", err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
         }
-        return out
+    }
+
+    func dbSize(self) -> Result[int] {
+        go! {
+            client, ctx, err := lamRedisState(s._client, s._context)
+            if err != nil {
+                return lamRedisFailure("DBSIZE", err)
+            }
+            value, err := client.DBSize(ctx).Result()
+            if err != nil {
+                return lamRedisFailure("DBSIZE", err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
+        }
     }
 }

@@ -20,7 +20,7 @@ from pathlib import Path
 LIB_ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = LIB_ROOT / "tests"
 COMPILER = os.environ.get("LAMC", "lamc")
-MIN_COMPILER_VERSION = (1, 16, 0)
+MIN_COMPILER_VERSION = (1, 18, 0)
 PACKAGE_PATH = Path("@lam") / "redis"
 AUTH_REDIS_HOST = "127.0.0.1"
 AUTH_REDIS_PORT = 6379

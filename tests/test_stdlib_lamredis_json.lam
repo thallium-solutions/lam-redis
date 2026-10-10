@@ -1,24 +1,31 @@
 # expect: redis-json:Ada:2
 # expect: object
-# expect: null
+# expect: missing-json-error:true
 
 from @lam/redis import Redis
+from lamerrors import Result
 from lamjson import Json
 
-func main() {
-    redis: Redis = Redis.connect("localhost:6379", password = "Password")
-    redis.delete(["lam:native:json"])
+func run() -> Result[bool] {
+    redis: Redis = Redis.connect("localhost:6379", password = "Password")?
+    _ = redis.delete(["lam:native:json"])?
     payload: json = {"name": "Ada", "roles": ["admin", "writer"]}
-    redis.setJson("lam:native:json", payload, 30)
+    _ = redis.setJson("lam:native:json", payload, 30)?
 
-    restored: json = Json.fromValue(redis.getJson("lam:native:json"))
+    restoredValue: any = redis.getJson("lam:native:json")?
+    restored: json = Json.fromValue(restoredValue)?
     name: str = restored.name
     count: int = len(restored.roles)
     print(f"redis-json:{name}:{count}")
     print(Json.kind(restored))
 
-    redis.delete(["lam:native:json"])
-    missing: json = Json.fromValue(redis.getJson("lam:native:json"))
-    print(Json.kind(missing))
-    redis.close()
+    _ = redis.delete(["lam:native:json"])?
+    missing: Result[json] = redis.getJson("lam:native:json")
+    print("missing-json-error:" + str(not missing.ok()))
+    _ = redis.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
 }

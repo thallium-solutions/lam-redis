@@ -2,6 +2,34 @@
 
 All notable changes to `@lam/redis` are documented here.
 
+## 2.0.0
+
+### Changed
+
+- Replaced expected service, transport, parse, timeout, cancellation,
+  wrong-type, and closed-client panics with unsuffixed typed `Result[T]` APIs.
+- Changed `connect` and `fromUrl` to return `Result[Redis]`, retain eager `PING`,
+  and close failed clients before returning an error.
+- Replaced missing-value sentinels in scalar, JSON, list, hash, sorted-set, TTL,
+  and Pub/Sub reads with explicit `RedisNotFound`, `RedisTimeout`, or
+  `RedisClosed` errors; `mget` now has ordered per-item results.
+- Replaced pipeline command dictionaries and `"error: ..."` strings with
+  `RedisCommand` and `Result[list[Result[any]]]`, preserving partial success and
+  per-command failures.
+- Added typed `RedisScanPage` and `RedisZMember` values, replaced `hsetMap` with
+  an overloaded `hset`, and retained `any` only at genuinely heterogeneous
+  Redis command/value boundaries.
+- Replaced class `__init__` methods with `init`, removed avoidable raw Go from
+  tests and value extraction, and made context unwrapping return errors rather
+  than panic.
+- Bumped the package major version to 2.0.0 and compiler compatibility to
+  `lamc ^1.18`; updated the consumer runner and tests accordingly.
+
+### Testing
+
+- Added a service-backed installed-package scenario composing authenticated
+  strings, JSON, collections, scans, pipelines, Pub/Sub, and typed failures.
+
 ## 1.0.0 - 2026-09-13
 
 ### Added

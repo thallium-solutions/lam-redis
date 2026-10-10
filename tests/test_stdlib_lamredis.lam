@@ -1,9 +1,12 @@
-# Integration test: @lam/redis exercises strings, counters, lists,
-# hashes, sets, sorted sets, scan, pub/sub, pipeline, and TTL.
+# Integration test: Result-first @lam/redis API.
 #
+# expect: connect-error: true
+# expect: url-error: true
 # expect: ping: PONG
-# expect: get-missing: <empty>
+# expect: get-missing-error: true
 # expect: set-and-get: hello
+# expect: mget-value: hello
+# expect: mget-missing-error: true
 # expect: setnx-first: true
 # expect: setnx-second: false
 # expect: get-after-setnx: hello
@@ -40,60 +43,64 @@
 # expect: zadd-alice: 1
 # expect: zincrBy-alice: 105
 # expect: zscore-bob: 90
+# expect: zscore-missing-error: true
 # expect: zrange-top: alice
 # expect: zrem: 1
 # expect: zcard: 1
 # expect: scan-found: 1
 # expect: pubsub-message: hello-subscribers
+# expect: pubsub-closed-error: true
 # expect: pipeline-get: pipeval
 # expect: pipeline-incr: 11
+# expect: pipeline-command-error: true
 # expect: type-string: string
 # expect: type-missing: none
 
-from @lam/redis import PubSub, Redis
+from @lam/redis import PubSub, Redis, RedisCommand, RedisScanPage, RedisZMember
+from lamerrors import Result
 
-func main() {
-    r: Redis = Redis.connect("localhost:6379", password = "Password")
-    r.flushDb()
+func run() -> Result[bool] {
+    invalid: Result[Redis] = Redis.connect("")
+    print("connect-error: " + str(not invalid.ok()))
+    invalidUrl: Result[Redis] = Redis.fromUrl("http://not-redis")
+    print("url-error: " + str(not invalidUrl.ok()))
 
-    print("ping: " + r.ping())
+    r: Redis = Redis.connect("localhost:6379", password = "Password")?
+    _ = r.flushDb()?
 
-    missing: str = r.get("does-not-exist")
-    if len(missing) == 0 {
-        print("get-missing: <empty>")
-    } else {
-        print("get-missing: " + missing)
-    }
-    r.set("greeting", "hello")
-    print("set-and-get: " + r.get("greeting"))
+    print("ping: " + r.ping()?)
 
-    first: bool = r.setNx("nx-key", "hello")
-    second: bool = r.setNx("nx-key", "world")
+    missing: Result[str] = r.get("does-not-exist")
+    print("get-missing-error: " + str(not missing.ok()))
+    _ = r.set("greeting", "hello")?
+    print("set-and-get: " + r.get("greeting")?)
+    multiple: list[Result[str]] = r.mget(["greeting", "does-not-exist"])?
+    mgetValue: str = multiple[0]?
+    print("mget-value: " + mgetValue)
+    print("mget-missing-error: " + str(not multiple[1].ok()))
+
+    first: bool = r.setNx("nx-key", "hello")?
+    second: bool = r.setNx("nx-key", "world")?
     print("setnx-first: " + str(first))
     print("setnx-second: " + str(second))
-    print("get-after-setnx: " + r.get("nx-key"))
+    print("get-after-setnx: " + r.get("nx-key")?)
 
-    ok: bool = r.expire("greeting", 60)
-    print("ttl-set: " + str(ok))
-    if r.ttl("greeting") > 0 {
-        print("ttl-positive: true")
-    } else {
-        print("ttl-positive: false")
-    }
-    print("persist: " + str(r.persist("greeting")))
-    print("ttl-after-persist: " + str(r.ttl("greeting")))
+    print("ttl-set: " + str(r.expire("greeting", 60)?))
+    print("ttl-positive: " + str(r.ttl("greeting")? > 0))
+    print("persist: " + str(r.persist("greeting")?))
+    print("ttl-after-persist: " + str(r.ttl("greeting")?))
 
-    print("exists: " + str(r.exists(["greeting"])))
-    print("delete: " + str(r.delete(["greeting"])))
-    print("exists-after-delete: " + str(r.exists(["greeting"])))
+    print("exists: " + str(r.exists(["greeting"])?))
+    print("delete: " + str(r.delete(["greeting"])?))
+    print("exists-after-delete: " + str(r.exists(["greeting"])?))
 
-    print("incr: " + str(r.incr("counter")))
-    print("incrBy-5: " + str(r.incrBy("counter", 5)))
-    print("decr: " + str(r.decr("counter")))
-    print("counter-final: " + r.get("counter"))
+    print("incr: " + str(r.incr("counter")?))
+    print("incrBy-5: " + str(r.incrBy("counter", 5)?))
+    print("decr: " + str(r.decr("counter")?))
+    print("counter-final: " + r.get("counter")?)
 
-    print("rpush-len: " + str(r.rpush("queue", ["a", "b", "c"])))
-    values: list[str] = r.lrange("queue", 0, - 1)
+    print("rpush-len: " + str(r.rpush("queue", ["a", "b", "c"])?))
+    values: list[str] = r.lrange("queue", 0, - 1)?
     joined: str = ""
     for i in range(len(values)) {
         if i > 0 {
@@ -103,112 +110,85 @@ func main() {
         }
     }
     print("lrange: " + joined)
-    print("lpop: " + r.lpop("queue"))
-    print("rpop: " + r.rpop("queue"))
-    print("llen-after-pops: " + str(r.llen("queue")))
+    print("lpop: " + r.lpop("queue")?)
+    print("rpop: " + r.rpop("queue")?)
+    print("llen-after-pops: " + str(r.llen("queue")?))
 
-    print("hset-1: " + str(r.hset("user:1", "name", "alice")))
+    print("hset-1: " + str(r.hset("user:1", "name", "alice")?))
     fields: dict[str, any] = {}
     fields["tier"] = "gold"
     fields["score"] = 5
-    _ = r.hsetMap("user:1", fields)
-    profile: dict[str, str] = r.hgetAll("user:1")
+    _ = r.hset("user:1", fields)?
+    profile: dict[str, str] = r.hgetAll("user:1")?
     print("hgetAll-name: " + profile["name"])
     print("hgetAll-tier: " + profile["tier"])
-    print("hexists-name: " + str(r.hexists("user:1", "name")))
-    print("hexists-missing: " + str(r.hexists("user:1", "nope")))
-    print("hincrBy: " + str(r.hincrBy("user:1", "score", 2)))
-    print("hkeys-count: " + str(len(r.hkeys("user:1"))))
-    print("hdel-count: " + str(r.hdel("user:1", ["name"])))
+    print("hexists-name: " + str(r.hexists("user:1", "name")?))
+    print("hexists-missing: " + str(r.hexists("user:1", "nope")?))
+    print("hincrBy: " + str(r.hincrBy("user:1", "score", 2)?))
+    hkeys: list[str] = r.hkeys("user:1")?
+    print("hkeys-count: " + str(len(hkeys)))
+    print("hdel-count: " + str(r.hdel("user:1", ["name"])?))
 
-    print("sadd: " + str(r.sadd("tags", ["go", "rust", "lam"])))
-    print("scard: " + str(r.scard("tags")))
-    print("sismember-go: " + str(r.sismember("tags", "go")))
-    print("sismember-php: " + str(r.sismember("tags", "php")))
-    print("smembers-count: " + str(len(r.smembers("tags"))))
-    print("srem: " + str(r.srem("tags", ["go"])))
+    print("sadd: " + str(r.sadd("tags", ["go", "rust", "lam"])?))
+    print("scard: " + str(r.scard("tags")?))
+    print("sismember-go: " + str(r.sismember("tags", "go")?))
+    print("sismember-php: " + str(r.sismember("tags", "php")?))
+    members: list[str] = r.smembers("tags")?
+    print("smembers-count: " + str(len(members)))
+    print("srem: " + str(r.srem("tags", ["go"])?))
 
-    print("zadd-alice: " + str(r.zadd("scores", 100.0, "alice")))
-    _ = r.zadd("scores", 90.0, "bob")
-    print("zincrBy-alice: " + str(int(r.zincrBy("scores", 5.0, "alice"))))
-    print("zscore-bob: " + str(int(r.zscore("scores", "bob"))))
-    top: list[dict[str, any]] = r.zrangeWithScores("scores", - 1, - 1)
-    member: str = ""
-    go! {
-        if len(top) > 0 {
-            if value, ok := top[0]["member"].(string); ok {
-                member = value
-            }
-        }
-    }
-    print("zrange-top: " + member)
-    print("zrem: " + str(r.zrem("scores", ["bob"])))
-    print("zcard: " + str(r.zcard("scores")))
+    print("zadd-alice: " + str(r.zadd("scores", 100.0, "alice")?))
+    _ = r.zadd("scores", 90.0, "bob")?
+    print("zincrBy-alice: " + str(int(r.zincrBy("scores", 5.0, "alice")?)))
+    print("zscore-bob: " + str(int(r.zscore("scores", "bob")?)))
+    missingScore: Result[float] = r.zscore("scores", "nobody")
+    print("zscore-missing-error: " + str(not missingScore.ok()))
+    top: list[RedisZMember] = r.zrangeWithScores("scores", - 1, - 1)?
+    print("zrange-top: " + top[0].member)
+    print("zrem: " + str(r.zrem("scores", ["bob"])?))
+    print("zcard: " + str(r.zcard("scores")?))
 
-    r.set("scan:k1", "1")
-    r.set("scan:k2", "2")
-    scanResult: dict[str, any] = r.scan(0, "scan:*", 100)
-    found: int = 0
-    go! {
-        if keys, ok := scanResult["keys"].([]string); ok {
-            found = len(keys)
-        }
-    }
-    if found >= 1 {
+    _ = r.set("scan:k1", "1")?
+    _ = r.set("scan:k2", "2")?
+    page: RedisScanPage = r.scan(0, "scan:*", 100)?
+    if len(page.keys) >= 1 {
         print("scan-found: 1")
     } else {
         print("scan-found: 0")
     }
 
-    ps: PubSub = r.subscribe(["events"])
-    ps.setTimeout(3000)
-    publisher: Redis = Redis.connect("localhost:6379", password = "Password")
-    _ = publisher.publish("events", "hello-subscribers")
-    publisher.close()
-    message: str = ps.next()
-    if len(message) > 0 {
-        print("pubsub-message: " + message)
-    } else {
-        print("pubsub-message: <timeout>")
-    }
-    ps.close()
+    ps: PubSub = r.subscribe(["events"])?
+    _ = ps.setTimeout(3000)?
+    publisher: Redis = Redis.connect("localhost:6379", password = "Password")?
+    _ = publisher.publish("events", "hello-subscribers")?
+    _ = publisher.close()?
+    message: str = ps.next()?
+    print("pubsub-message: " + message)
+    _ = ps.close()?
+    afterClose: Result[str] = ps.next()
+    print("pubsub-closed-error: " + str(not afterClose.ok()))
 
-    r.set("pipekey", "pipeval")
-    r.set("counter2", "10")
-    getCommand: dict[str, any] = {}
-    getCommand["cmd"] = "GET"
-    getArgs: list[any] = []
-    getArgs.append("pipekey")
-    getCommand["args"] = getArgs
-    incrCommand: dict[str, any] = {}
-    incrCommand["cmd"] = "INCR"
-    incrArgs: list[any] = []
-    incrArgs.append("counter2")
-    incrCommand["args"] = incrArgs
-    commands: list[dict[str, any]] = []
-    commands.append(getCommand)
-    commands.append(incrCommand)
-    results: list[any] = r.pipeline(commands)
-    pipeGet: str = ""
-    pipeIncr: str = ""
-    go! {
-        if len(results) > 0 {
-            pipeGet = fmt.Sprintf("%v", results[0])
-        }
-        if len(results) > 1 {
-            pipeIncr = fmt.Sprintf("%v", results[1])
-        }
-    }
+    _ = r.set("pipekey", "pipeval")?
+    _ = r.set("counter2", "10")?
+    commands: list[RedisCommand] = [
+    RedisCommand("GET", ["pipekey"]),
+    RedisCommand("INCR", ["counter2"]),
+    RedisCommand("INCR", ["pipekey"]),
+    ]
+    results: list[Result[any]] = r.pipeline(commands)?
+    pipeGet: str = results[0]?
     print("pipeline-get: " + pipeGet)
-    print("pipeline-incr: " + pipeIncr)
+    print("pipeline-incr: " + str(results[1]?))
+    print("pipeline-command-error: " + str(not results[2].ok()))
 
-    print("type-string: " + r.type_("pipekey"))
-    print("type-missing: " + r.type_("never-existed"))
+    print("type-string: " + r.type_("pipekey")?)
+    print("type-missing: " + r.type_("never-existed")?)
 
-    r.flushDb()
-    r.close()
+    _ = r.flushDb()?
+    _ = r.close()?
+    return Result.Ok(true)
 }
 
-go! {
-    import "fmt"
+func main() {
+    _ = run().unwrap()
 }

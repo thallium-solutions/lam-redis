@@ -1,0 +1,173 @@
+# Complex service-backed coverage for the v2 Result-first Redis API.
+# expect: PASS 1 authenticated connection and ping
+# expect: PASS 2 empty string remains a present value
+# expect: PASS 3 missing GET is typed RedisNotFound
+# expect: PASS 4 expiry reports a positive TTL
+# expect: PASS 5 persist restores a persistent key
+# expect: PASS 6 counters compose across increment and decrement
+# expect: PASS 7 JSON round trip preserves structured data
+# expect: PASS 8 scalar hset overload reports a new field
+# expect: PASS 9 map hset overload and hash reads compose
+# expect: PASS 10 list operations preserve ordering
+# expect: PASS 11 set operations preserve membership semantics
+# expect: PASS 12 sorted-set members use the typed score model
+# expect: PASS 13 scan returns typed pages and namespace keys
+# expect: PASS 14 mget preserves successful empty and nonempty values
+# expect: PASS 15 mget preserves typed per-item not-found results
+# expect: PASS 16 pipeline keeps successes around failed commands
+# expect: PASS 17 pipeline command failures remain typed Results
+# expect: PASS 18 subscribed publisher count is deterministic
+# expect: PASS 19 pubsub metadata preserves channel and payload
+# expect: PASS 20 invalid scan arguments return a typed error
+# expect: PASS 21 empty subscriptions return a typed error
+# expect: PASS 22 namespace cleanup removes every test key
+# expect: 22 passed, 0 failed, 22 total
+
+from @lam/redis import PubSub, Redis, RedisCommand, RedisScanPage, RedisZMember
+from lamerrors import Error, Result
+from lamjson import Json
+from lamtest import Test
+
+func cleanup(redis: Redis, prefix: str) -> Result[bool] {
+    names: list[str] = redis.keys(prefix + "*")?
+    if len(names) > 0 {
+        _ = redis.delete(names)?
+    }
+    return Result.Ok(true)
+}
+
+func run() -> Result[bool] {
+    prefix: str = "lam:v2:complex:redis:"
+    redis: Redis = Redis.connect("localhost:6379", password = "Password")?
+    _ = cleanup(redis, prefix)?
+    pong: str = redis.ping()?
+    Test.assertTrue(pong == "PONG", "1 authenticated connection and ping")
+
+    emptyKey: str = prefix + "empty"
+    missingKey: str = prefix + "missing"
+    _ = redis.set(emptyKey, "")?
+    empty: Result[str] = redis.get(emptyKey)
+    Test.assertTrue(empty.ok() and empty.value == "", "2 empty string remains a present value")
+    missing: Result[str] = redis.get(missingKey)
+    missingError: Error = missing.error
+    Test.assertTrue(not missing.ok() and missingError.kind == "RedisNotFound", "3 missing GET is typed RedisNotFound")
+
+    expiryKey: str = prefix + "expiry"
+    _ = redis.set(expiryKey, "alive")?
+    expires: bool = redis.expire(expiryKey, 60)?
+    remaining: int = redis.ttl(expiryKey)?
+    Test.assertTrue(expires and remaining > 0 and remaining <= 60, "4 expiry reports a positive TTL")
+    persisted: bool = redis.persist(expiryKey)?
+    persistentTtl: int = redis.ttl(expiryKey)?
+    Test.assertTrue(persisted and persistentTtl == -1, "5 persist restores a persistent key")
+
+    counterKey: str = prefix + "counter"
+    firstCount: int = redis.incr(counterKey)?
+    raisedCount: int = redis.incrBy(counterKey, 9)?
+    finalCount: int = redis.decrBy(counterKey, 3)?
+    Test.assertTrue(firstCount == 1 and raisedCount == 10 and finalCount == 7, "6 counters compose across increment and decrement")
+
+    jsonKey: str = prefix + "json"
+    payload: json = {"name": "Ada", "roles": ["admin", "writer"]}
+    _ = redis.setJson(jsonKey, payload, 60)?
+    restoredValue: any = redis.getJson(jsonKey)?
+    restored: json = Json.fromValue(restoredValue)?
+    Test.assertTrue(Json.kind(restored) == "object" and restored.name == "Ada" and len(restored.roles) == 2, "7 JSON round trip preserves structured data")
+
+    hashKey: str = prefix + "hash"
+    scalarFieldCount: int = redis.hset(hashKey, "name", "alice")?
+    Test.assertTrue(scalarFieldCount == 1, "8 scalar hset overload reports a new field")
+    fields: dict[str, any] = {}
+    fields["tier"] = "gold"
+    fields["visits"] = 4
+    addedFields: int = redis.hset(hashKey, fields)?
+    allFields: dict[str, str] = redis.hgetAll(hashKey)?
+    visits: int = redis.hincrBy(hashKey, "visits", 3)?
+    Test.assertTrue(addedFields == 2 and allFields["name"] == "alice" and allFields["tier"] == "gold" and visits == 7, "9 map hset overload and hash reads compose")
+
+    listKey: str = prefix + "list"
+    _ = redis.rpush(listKey, ["middle", "tail"])?
+    _ = redis.lpush(listKey, ["head"])?
+    listValues: list[str] = redis.lrange(listKey, 0, - 1)?
+    Test.assertTrue(len(listValues) == 3 and listValues[0] == "head" and listValues[2] == "tail", "10 list operations preserve ordering")
+
+    setKey: str = prefix + "set"
+    inserted: int = redis.sadd(setKey, ["red", "green", "red"])?
+    removed: int = redis.srem(setKey, ["green"])?
+    setSize: int = redis.scard(setKey)?
+    hasRed: bool = redis.sismember(setKey, "red")?
+    Test.assertTrue(inserted == 2 and removed == 1 and setSize == 1 and hasRed, "11 set operations preserve membership semantics")
+
+    zsetKey: str = prefix + "zset"
+    _ = redis.zadd(zsetKey, 2.5, "second")?
+    _ = redis.zadd(zsetKey, 1.5, "first")?
+    ranked: list[RedisZMember] = redis.zrangeWithScores(zsetKey, 0, - 1)?
+    Test.assertTrue(len(ranked) == 2 and ranked[0].member == "first" and ranked[0].score == 1.5 and ranked[1].member == "second", "12 sorted-set members use the typed score model")
+
+    scanKeyA: str = prefix + "scan:a"
+    scanKeyB: str = prefix + "scan:b"
+    _ = redis.set(scanKeyA, "a")?
+    _ = redis.set(scanKeyB, "b")?
+    cursor: int = 0
+    found: int = 0
+    scanning: bool = true
+    while scanning {
+        page: RedisScanPage = redis.scan(cursor, prefix + "scan:*", 100)?
+        found = found + len(page.keys)
+        cursor = page.cursor
+        if cursor == 0 {
+            scanning = false
+        }
+    }
+    Test.assertTrue(found == 2 and cursor == 0, "13 scan returns typed pages and namespace keys")
+
+    valueKey: str = prefix + "value"
+    _ = redis.set(valueKey, "value")?
+    multiple: list[Result[str]] = redis.mget([emptyKey, valueKey, missingKey])?
+    emptyFromMany: str = multiple[0]?
+    valueFromMany: str = multiple[1]?
+    Test.assertTrue(len(multiple) == 3 and emptyFromMany == "" and valueFromMany == "value", "14 mget preserves successful empty and nonempty values")
+    manyMissingError: Error = multiple[2].error
+    Test.assertTrue(not multiple[2].ok() and manyMissingError.kind == "RedisNotFound", "15 mget preserves typed per-item not-found results")
+
+    commands: list[RedisCommand] = [
+    RedisCommand("GET", [valueKey]),
+    RedisCommand("INCR", [valueKey]),
+    RedisCommand("GET", [missingKey]),
+    RedisCommand("GET", [emptyKey]),
+    ]
+    piped: list[Result[any]] = redis.pipeline(commands)?
+    pipedValue: str = piped[0]?
+    pipedEmpty: str = piped[3]?
+    Test.assertTrue(len(piped) == 4 and pipedValue == "value" and pipedEmpty == "", "16 pipeline keeps successes around failed commands")
+    wrongTypeError: Error = piped[1].error
+    pipelineMissingError: Error = piped[2].error
+    Test.assertTrue(not piped[1].ok() and wrongTypeError.kind == "RedisError" and not piped[2].ok() and pipelineMissingError.kind == "RedisNotFound", "17 pipeline command failures remain typed Results")
+
+    channel: str = prefix + "events"
+    subscription: PubSub = redis.subscribe([channel])?
+    _ = subscription.setTimeout(3000)?
+    subscribers: int = redis.publish(channel, "ready")?
+    Test.assertTrue(subscribers == 1, "18 subscribed publisher count is deterministic")
+    event: dict[str, str] = subscription.nextWith()?
+    Test.assertTrue(event["channel"] == channel and event["pattern"] == "" and event["payload"] == "ready", "19 pubsub metadata preserves channel and payload")
+    _ = subscription.close()?
+
+    invalidScan: Result[RedisScanPage] = redis.scan(-1)
+    invalidScanError: Error = invalidScan.error
+    Test.assertTrue(not invalidScan.ok() and invalidScanError.kind == "RedisArgumentError", "20 invalid scan arguments return a typed error")
+    invalidSubscription: Result[PubSub] = redis.subscribe([])
+    invalidSubscriptionError: Error = invalidSubscription.error
+    Test.assertTrue(not invalidSubscription.ok() and invalidSubscriptionError.kind == "RedisArgumentError", "21 empty subscriptions return a typed error")
+
+    _ = cleanup(redis, prefix)?
+    remainingKeys: list[str] = redis.keys(prefix + "*")?
+    Test.assertTrue(len(remainingKeys) == 0, "22 namespace cleanup removes every test key")
+    _ = redis.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+    Test.summary()
+}

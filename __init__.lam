@@ -3,8 +3,8 @@
 #
 # Public @lam/redis package surface.
 
-from .redis import PubSub, Redis
+from .redis import PubSub, Redis, RedisCommand, RedisScanPage, RedisZMember
 
 func tag() -> str {
-    return "@lam/redis@1.0.0"
+    return "@lam/redis@2.0.0"
 }
