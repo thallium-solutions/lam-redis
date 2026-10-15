@@ -4,7 +4,3 @@
 # Public @lam/redis package surface.
 
 from .redis import PubSub, Redis, RedisCommand, RedisScanPage, RedisZMember
-
-func tag() -> str {
-    return "@lam/redis@2.0.0"
-}

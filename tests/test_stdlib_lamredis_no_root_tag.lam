@@ -1,0 +1,18 @@
+# Regression: the package no longer declares a root ``tag()`` (name and
+# version live in lamlib.toml), so an application or another package may
+# declare its own top-level ``tag`` and still link with this package.
+#
+# expect: tag=application
+# expect: command=PING
+
+from @lam/redis import RedisCommand
+
+func tag() -> str {
+    return "application"
+}
+
+func main() {
+    print("tag=" + tag())
+    command: RedisCommand = RedisCommand("PING")
+    print("command=" + command.name)
+}
