@@ -1,6 +1,6 @@
 [library]
 name = "@lam/redis"
-version = "2.0.0"
+version = "2.0.1"
 description = "Result-first Redis client with strings, JSON, collections, pub/sub, and typed pipelines"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,7 +8,7 @@ repository = "https://github.com/thallium-solutions/lam-redis"
 homepage = "https://github.com/thallium-solutions/lam-redis"
 
 [compatibility]
-lamc = "^1.18"
+lamc = ">=1.18, <3"
 
 [go-deps]
 "github.com/redis/go-redis/v9" = "v9.19.0"

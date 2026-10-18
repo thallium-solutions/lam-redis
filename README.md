@@ -12,7 +12,7 @@ rather than panic or sentinel values.
 
 ## Requirements and installation
 
-- `lamc` 1.18.0 or newer in the compatible `^1.18` range.
+- `lamc` 1.18.0 or newer including 2.x (`>=1.18, <3`).
 - Go capable of building `github.com/redis/go-redis/v9 v9.19.0`.
 - A Redis-compatible server for runtime use and integration tests.
 
