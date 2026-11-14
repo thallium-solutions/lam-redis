@@ -2,6 +2,24 @@
 
 All notable changes to `@lam/redis` are documented here.
 
+## [2.0.4] - 2026-11-14
+
+### Tests
+
+- `tests/test_stdlib_lamredis_edge_cases.lam`: both fixtures (the
+  unauthenticated `localhost:6380` was unused), wrong and missing passwords,
+  negative databases, URLs with passwords and databases, database isolation,
+  `dbSize`/`flushDb`; byte-exact, non-ASCII, empty and 1 MiB values and the
+  conversion of int/float/bool values; `getDel`, `keys`, `exec` (echo, empty,
+  unknown and nil replies); wrong-type and overflow errors; negative list
+  ranges and empty pops; non-ASCII hash fields; lifecycle of missing keys;
+  sorted-set scores; pub/sub timeouts, negative timeouts and pattern
+  subscriptions; every operation on a closed client.
+- `tests/test_stdlib_lamredis_rate_limiter_composed.lam`: a `RateLimiter`
+  class (INCR + EXPIRE) raced by 100 async requests from 5 clients, block
+  notices over `psubscribe` collected by a listener task, a pipeline and a
+  typed leaderboard, `?`, `do/catch` and comprehensions.
+
 ## [2.0.3] - 2026-11-03
 
 ### Changed

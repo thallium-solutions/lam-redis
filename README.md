@@ -17,7 +17,7 @@ rather than panic or sentinel values.
 - A Redis-compatible server for runtime use and integration tests.
 
 ```bash
-lamc install @lam/redis@2.0.0
+lamc install @lam/redis@2.0.4
 # or
 lamc install https://github.com/thallium-solutions/lam-redis.git
 ```

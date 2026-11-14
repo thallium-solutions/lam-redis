@@ -1,0 +1,142 @@
+# Cross-feature: a fixed-window rate limiter and leaderboard shared by
+# concurrent tasks. `RateLimiter` (a class over one Redis client) counts
+# requests with INCR + EXPIRE, 100 async requests from 5 clients race on it
+# and exactly `limit` per client are allowed; blocked clients are announced
+# over pub/sub (psubscribe) and collected by a listener task; a pipeline
+# records the scores of a leaderboard read back with typed members; errors
+# flow through `?` and `do/catch`; outcomes are summarised with
+# comprehensions.
+#
+# expect: allowed per client: [alice:7 bob:7 carol:7 dave:7 eve:7]
+# expect: blocked: 65
+# expect: window ttl set: true
+# expect: block notices: 5 clients [alice bob carol dave eve]
+# expect: pipeline: 6 ok, 0 failed
+# expect: leaderboard: eve:20 dave:20 carol:20 bob:20 alice:20
+# expect: wrong type surfaces: RedisError
+# expect: reset: 0 keys left
+# expect: ok
+
+from @lam/redis import Redis, RedisCommand, RedisZMember, PubSub
+from lamerrors import Result, Error
+
+const P: str = "lam:composed:redis:"
+
+class RateLimiter {
+    func init(self, redis: Redis, limit: int, windowSec: int) {
+        self.redis: Redis = redis
+        self.limit: int = limit
+        self.windowSec: int = windowSec
+    }
+
+    func key(self, client: str) -> str {
+        return P + "window:" + client
+    }
+
+    func allow(self, client: str) -> Result[bool] {
+        count: int = self.redis.incr(self.key(client))?
+        if count == 1 {
+            _ = self.redis.expire(self.key(client), self.windowSec)?
+        }
+        if count > self.limit {
+            if count == self.limit + 1 {
+                _ = self.redis.publish(P + "blocked." + client, client)?
+            }
+            return Result.Ok(false)
+        }
+        return Result.Ok(true)
+    }
+}
+
+async func request(limiter: RateLimiter, client: str) -> Result[bool] {
+    return limiter.allow(client)
+}
+
+async func listen(subscription: PubSub, expected: int) -> list[str] {
+    seen: list[str] = []
+    while len(seen) < expected {
+        r: Result[dict[str, str]] = subscription.nextWith()
+        if not r.ok() {
+            break
+        }
+        seen.append(r.unwrap()["payload"])
+    }
+    return seen
+}
+
+func entry(m: RedisZMember) -> str {
+    return f"{m.member}:{int(m.score)}"
+}
+
+func cleanup(redis: Redis) -> Result[int] {
+    keys: list[str] = redis.keys(P + "*")?
+    if len(keys) == 0 {
+        return Result.Ok(0)
+    }
+    return redis.delete(keys)
+}
+
+func run() -> Result[bool] {
+    redis: Redis = Redis.connect("localhost:6379", password="Password")?
+    publisherSide: Redis = Redis.connect("localhost:6379", password="Password")?
+    _ = cleanup(redis)?
+
+    clients: list[str] = ["alice", "bob", "carol", "dave", "eve"]
+    notices: PubSub = publisherSide.psubscribe([P + "blocked.*"])?
+    _ = notices.setTimeout(5000)?
+    collector = listen(notices, len(clients))
+
+    limiter: RateLimiter = RateLimiter(redis, 7, 60)
+    names: list[str] = [clients[i % 5] for i in range(100)]
+    pending = [request(limiter, name) for name in names]
+    outcomes: list[bool] = []
+    for task in pending {
+        r: Result[bool] = await task
+        outcomes.append(r.unwrapOr(false))
+    }
+    allowed: dict[str, int] = {c: 0 for c in clients}
+    for i, ok in enumerate(outcomes) {
+        if ok {
+            allowed[names[i]] += 1
+        }
+    }
+    print(f"allowed per client: [{' '.join([c + ':' + str(allowed[c]) for c in clients])}]")
+    print(f"blocked: {len([o for o in outcomes if not o])}")
+    ttl: int = redis.ttl(limiter.key("alice"))?
+    print(f"window ttl set: {ttl > 0 and ttl <= 60}")
+
+    heard: list[str] = await collector
+    print(f"block notices: {len(heard)} clients [{' '.join(sorted(heard))}]")
+    _ = notices.close()?
+
+    commands: list[RedisCommand] = [RedisCommand("ZINCRBY", [P + "board", allowed[c] + 13, c]) for c in clients]
+    commands.append(RedisCommand("ZCARD", [P + "board"]))
+    results: list[Result[any]] = redis.pipeline(commands)?
+    print(f"pipeline: {len([x for x in results if x.ok()])} ok, {len([x for x in results if not x.ok()])} failed")
+    board: list[RedisZMember] = redis.zrangeWithScores(P + "board", 0, -1)?
+    ranked: list[RedisZMember] = [board[len(board) - 1 - i] for i in range(len(board))]
+    print(f"leaderboard: {' '.join([entry(m) for m in ranked])}")
+
+    do {
+        _ = redis.set(P + "text", "not a counter")?
+        _ = redis.incr(P + "text")?
+        print("wrong type surfaces: nothing")
+    } catch err {
+        print(f"wrong type surfaces: {err.kind}")
+    }
+
+    _ = cleanup(redis)?
+    print(f"reset: {len(redis.keys(P + '*')?)} keys left")
+    _ = publisherSide.close()?
+    _ = redis.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"unexpected: {r.error}")
+        return
+    }
+    print("ok")
+}

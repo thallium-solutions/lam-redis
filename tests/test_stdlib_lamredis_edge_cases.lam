@@ -1,0 +1,154 @@
+# Edge cases and error paths: both fixtures (localhost:6379 with password
+# "Password", localhost:6380 without authentication), databases, URLs,
+# binary and non-ASCII values, wrong types, timeouts and closed clients.
+#
+# expect: auth: wrong-password=RedisError no-password=RedisError negative-db=RedisArgumentError url-password=PONG
+# expect: databases: db1-isolated=true url-db2-isolated=true dbsize=2 flushed=0
+# expect: values: bytes=true unicode=true empty=true 1MiB=true
+# expect: value conversions: 42 1.5 1 0
+# expect: getDel: once once-more=RedisNotFound
+# expect: keys: [k:a k:b k:é]
+# expect: exec: echo=hé empty=RedisArgumentError unknown=RedisError missing=RedisNotFound
+# expect: wrong types: lpush=RedisError incr=RedisError hget=RedisError overflow=RedisError
+# expect: lists: [b c] [a b c] empty-pop=RedisNotFound
+# expect: hash: Zoë 🦅 field=RedisNotFound
+# expect: lifecycle: expire-missing=false persist-missing=false ttl-missing=RedisNotFound
+# expect: sorted set: [low:-1.5 mid:0 high:2.25] score=2.25
+# expect: pubsub: timeout=RedisTimeout negative=RedisArgumentError pattern=news.* channel=news.fr payload=Grüße
+# expect: closed client: 6/6 RedisError
+# expect: ok
+
+from @lam/redis import Redis, RedisZMember, PubSub
+from lamerrors import Result
+
+go! {
+    func redisAllBytes() string {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return string(raw)
+    }
+}
+
+const P: str = "lam:edge:redis:"
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func cleanup(r: Redis) -> Result[int] {
+    keys: list[str] = r.keys(P + "*")?
+    if len(keys) == 0 {
+        return Result.Ok(0)
+    }
+    return r.delete(keys)
+}
+
+func scored(m: RedisZMember) -> str {
+    return f"{m.member}:{m.score}"
+}
+
+func run() -> Result[bool] {
+    # ── Authentication, databases, URLs ─────────────────────────
+    wrong: Result[Redis] = Redis.connect("localhost:6379", password="wrong")
+    none: Result[Redis] = Redis.connect("localhost:6379")
+    negative: Result[Redis] = Redis.connect("localhost:6380", db=-1)
+    viaUrl: Redis = Redis.fromUrl("redis://:Password@localhost:6379/0")?
+    print(f"auth: wrong-password={kind(wrong)} no-password={kind(none)} negative-db={kind(negative)} url-password={viaUrl.ping()?}")
+    _ = viaUrl.close()?
+
+    db0: Redis = Redis.connect("localhost:6380")?
+    db1: Redis = Redis.connect("localhost:6380", db=1)?
+    db2: Redis = Redis.fromUrl("redis://localhost:6380/2")?
+    _ = db1.flushDb()?
+    _ = db2.flushDb()?
+    _ = db1.set(P + "where", "db1")?
+    _ = db2.set(P + "where", "db2")?
+    _ = db2.set(P + "other", "db2")?
+    isolated1: bool = db1.get(P + "where")? == "db1" and kind(db0.get(P + "where")) == "RedisNotFound"
+    isolated2: bool = db2.get(P + "where")? == "db2"
+    size: int = db2.dbSize()?
+    _ = db2.flushDb()?
+    print(f"databases: db1-isolated={isolated1} url-db2-isolated={isolated2} dbsize={size} flushed={db2.dbSize()?}")
+    _ = db1.flushDb()?
+
+    r: Redis = Redis.connect("localhost:6379", password="Password")?
+    _ = cleanup(r)?
+
+    # ── Values ──────────────────────────────────────────────────
+    raw: str = ""
+    go! {
+        raw = redisAllBytes()
+    }
+    _ = r.set(P + "bytes", raw)?
+    back: str = r.get(P + "bytes")?
+    _ = r.set(P + "text", "Grüße 🦅 東京")?
+    _ = r.set(P + "empty", "")?
+    big: str = "λ" * 524288
+    _ = r.set(P + "big", big)?
+    print(f"values: bytes={back == raw and len(bytes(back)) == 256} unicode={r.get(P + 'text')? == 'Grüße 🦅 東京'} empty={r.get(P + 'empty')? == ''} 1MiB={r.get(P + 'big')? == big}")
+    _ = r.set(P + "int", 42)?
+    _ = r.set(P + "float", 1.5)?
+    _ = r.set(P + "true", true)?
+    _ = r.set(P + "false", false)?
+    print(f"value conversions: {r.get(P + 'int')?} {r.get(P + 'float')?} {r.get(P + 'true')?} {r.get(P + 'false')?}")
+
+    _ = r.set(P + "once", "once")?
+    print(f"getDel: {r.getDel(P + 'once')?} once-more={kind(r.getDel(P + 'once'))}")
+    _ = r.mset({P + "k:a": 1, P + "k:b": 2, P + "k:é": 3})?
+    print(f"keys: [{' '.join(sorted([k[len(P):] for k in r.keys(P + 'k:*')?]))}]")
+
+    print(f"exec: echo={r.exec('ECHO', ['hé'])?} empty={kind(r.exec(' '))} unknown={kind(r.exec('NOSUCHCOMMAND'))} missing={kind(r.exec('GET', [P + 'missing']))}")
+
+    # ── Wrong types and overflow ────────────────────────────────
+    _ = r.set(P + "max", "9223372036854775807")?
+    print(f"wrong types: lpush={kind(r.lpush(P + 'text', ['x']))} incr={kind(r.incr(P + 'text'))} hget={kind(r.hget(P + 'text', 'f'))} overflow={kind(r.incr(P + 'max'))}")
+
+    # ── Lists, hashes, lifecycle, sorted sets ───────────────────
+    _ = r.rpush(P + "list", ["a", "b", "c"])?
+    print(f"lists: {r.lrange(P + 'list', -2, -1)?} {r.lrange(P + 'list', 0, 100)?} empty-pop={kind(r.lpop(P + 'nolist'))}")
+    _ = r.hset(P + "hash", {"名前": "Zoë", "鳥": "🦅"})?
+    print(f"hash: {r.hget(P + 'hash', '名前')?} {r.hget(P + 'hash', '鳥')?} field={kind(r.hget(P + 'hash', 'nope'))}")
+    print(f"lifecycle: expire-missing={r.expire(P + 'missing', 10)?} persist-missing={r.persist(P + 'missing')?} ttl-missing={kind(r.ttl(P + 'missing'))}")
+    _ = r.zadd(P + "z", 2.25, "high")?
+    _ = r.zadd(P + "z", -1.5, "low")?
+    _ = r.zadd(P + "z", 0.0, "mid")?
+    members: list[RedisZMember] = r.zrangeWithScores(P + "z", 0, -1)?
+    print(f"sorted set: [{' '.join([scored(m) for m in members])}] score={r.zscore(P + 'z', 'high')?}")
+
+    # ── Pub/Sub ─────────────────────────────────────────────────
+    quiet: PubSub = r.subscribe([P + "quiet"])?
+    _ = quiet.setTimeout(150)?
+    timeout: Result[str] = quiet.next()
+    negativeTimeout: Result[bool] = quiet.setTimeout(-1)
+    _ = quiet.close()?
+    news: PubSub = r.psubscribe(["news.*"])?
+    _ = news.setTimeout(3000)?
+    _ = r.publish("news.fr", "Grüße")?
+    message: dict[str, str] = news.nextWith()?
+    _ = news.close()?
+    print(f"pubsub: timeout={kind(timeout)} negative={kind(negativeTimeout)} pattern={message['pattern']} channel={message['channel']} payload={message['payload']}")
+
+    _ = cleanup(r)?
+    _ = r.close()?
+    _ = r.close()?
+    closed: list[str] = [kind(r.ping()), kind(r.get("k")), kind(r.set("k", "v")), kind(r.exec("PING")), kind(r.publish("c", "m")), kind(r.subscribe(["c"]))]
+    print(f"closed client: {len([k for k in closed if k == 'RedisError'])}/{len(closed)} {','.join(sorted(set(closed)))}")
+    _ = db0.close()?
+    _ = db1.close()?
+    _ = db2.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"unexpected: {r.error}")
+        return
+    }
+    print("ok")
+}
